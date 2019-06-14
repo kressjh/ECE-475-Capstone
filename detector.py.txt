@@ -1,0 +1,229 @@
+
+rm_shield_detector.py
+
+import cv2
+import numpy as np
+import argparse
+import serial
+import rospy
+import sys
+
+from cv_bridge import CvBridge, CvBridgeError
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+
+# for face detection
+faceCascade = cv2.CascadeClassifier('/home/nuc/catkin_ws/src/shield_detector/src/haarcascade_frontalface_default.xml')
+
+
+class RMShieldDetector:
+	def __init__(self):
+		# fields
+		self.bridge = CvBridge()
+		self.detected_shield_x = 0.0
+		self.detected_shield_y = 0.0
+		self.pitch_req = 0.0
+		self.yaw_req = 0.0
+		#self.serCoor = serial.Serial('/dev/ttyACM0', 9600)
+		self.tx = [0] * 6
+		self.tx[0] = 0xFA
+		self.tx[1] = 0x00
+		self.size = 5
+		self.angleDiff = 5
+		self.angleFlip = 60
+		self.lengthThresh = 0
+		self.heightThresh = 20
+		self.lengthDiff = 50
+		self.ratioThresh = 3
+		self.offsetThresh = 0
+		self.detected_shield_x = 0
+		self.detected_shield_y = 0
+
+		# shield information
+		self.height1 = 0
+		self.width1 = 0
+		self.heigh2 = 0
+		self.width2 = 0
+		self.angle1 = 0
+		self.angle2 = 0
+		self.ratio1 = 0
+		self.ratio2 = 0
+
+		# template matching
+		#self.templateImg = imread('/home/joseph/Desktop/Box.png', 0)
+		self.corner_x = 0
+		self.corner_y = 0
+		self.searchCorner_x = 0
+		self.searchCorner_y = 0
+		self.shield_width = 1
+		self.cropImage = None
+		self.searchArea = None
+		self.cropImageNull = True
+
+		#threshold values
+		self.lightAvg = 0
+
+		# Shield detection
+		self.anglePass = False
+		self.offsetPass = False
+		self.lengthPass = False
+		self.heightPass = False
+
+
+		# ros
+		self.sub_image_raw = rospy.Subscriber('/usb_cam/image_raw', Image, self.handle_image_raw)
+		rospy.init_node('rm_shield_detector', anonymous=True) #initializes this program as a node
+		rospy.spin()
+
+
+	def handle_image_raw(self, data):
+		try:
+			img = self.bridge.imgmsg_to_cv2(data, 'bgr8')
+		except CvBridgeError as e:
+			print(e)
+
+		# 1) generate threshold image
+			#converting img from rgb to hsv
+		hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+		lower_blue = np.array([110, 50, 50])
+		upper_blue = np.array([130, 255, 255])
+		mask_blue = cv2.inRange(hsv, lower_blue, upper_blue) # mask of blue
+		img_blue = cv2.bitwise_and(hsv, hsv, mask = mask_blue) # filtered img of blue component
+
+		lower_red = np.array([0, 50, 50])
+		upper_red = np.array([10, 255, 255])
+		mask1 = cv2.inRange(hsv, lower_red, upper_red)
+
+		lower_red = np.array([170, 50, 50])
+		upper_red = np.array([180, 255, 255])
+		mask2 = cv2.inRange(hsv, lower_red, upper_red) #2 masks for 2 ranges of color red
+
+		mask_red = mask1 + mask2 # join the masks
+		img_red = cv2.bitwise_and(hsv, hsv, mask = mask_red) # filtered img of red component
+
+		lower_green = np.array([65, 60, 60])
+		upper_green = np.array([80, 255, 255])
+		mask_green = cv2.inRange(hsv, lower_green, upper_green) # mask of green
+		img_green = cv2.bitwise_and(hsv, hsv, mask = mask_green) # filtered img of green component
+
+
+		# 2) morphological operations
+		img_blue_processed = cv2.dilate(img_blue, None, iterations=2)
+		img_blue_processed = cv2.erode(img_blue_processed, None, iterations=2)
+		gray_img_blue = cv2.cvtColor(img_blue_processed, cv2.COLOR_BGR2GRAY) #converts the img to 1 channel
+
+		img_red_processed = cv2.dilate(img_red, None, iterations=2)
+		img_red_processed = cv2.erode(img_red_processed, None, iterations=2)
+		gray_img_red = cv2.cvtColor(img_red_processed, cv2.COLOR_BGR2GRAY) #converts the img to 1 channel
+
+		img_green_processed = cv2.dilate(img_green, None, iterations=2)
+		img_green_processed = cv2.erode(img_green_processed, None, iterations=2)
+		gray_img_green = cv2.cvtColor(img_green_processed, cv2.COLOR_BGR2GRAY) #converts the img to 1 channel
+
+
+
+		# 3) contour detection
+		contours_blue = cv2.findContours(gray_img_blue.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)[-2]
+		contours_blue = sorted(contours_blue, key=cv2.contourArea, reverse=True)
+
+		contours_red = cv2.findContours(gray_img_red.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)[-2]
+		contours_red = sorted(contours_red, key=cv2.contourArea, reverse=True)
+
+		contours_green = cv2.findContours(gray_img_green.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)[-2]
+		contours_green = sorted(contours_green, key=cv2.contourArea, reverse=True)
+
+
+		#4) filtering contours by size
+		contours = [contours_blue, contours_red, contours_green]
+		for x in contours:
+			if x:
+				area = cv2.contourArea(x[0])
+				rect = cv2.minAreaRect(x[0])
+				entroid = (0,0)
+				if area > 2000: #only coutours of the size of a t-shirt should be drawn out
+					#get coordinates of the centroid of the largest valid contour
+					box = cv2.boxPoints(rect)
+					pt_upperleft = box[0]
+					pt_lowerright = box[2]
+					center_x = (pt_upperleft[0] + pt_lowerright[0])/2
+					center_y = (pt_upperleft[1] + pt_lowerright[1])/2
+					centroid = (center_x, center_y) #This coordinate should be stored as a global variable. but where should it be declared?
+					box = np.int0(box)
+					if x == contours_blue:
+						cv2.drawContours(img, [box], 0, (0, 0, 255), 1) #draw out the contour in rectangle
+						cv2.putText(img, 'Friend', (pt_upperleft[0], pt_upperleft[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 1, cv2.LINE_AA)
+					if x == contours_red:
+						cv2.drawContours(img, [box], 0, (255, 0, 0), 1) #draw out the contour in rectangle
+						cv2.putText(img, 'Enemy', (pt_upperleft[0], pt_upperleft[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 1, cv2.LINE_AA)
+					if x == contours_green:
+						cv2.drawContours(img, [box], 0, (0, 255, 0), 1) #draw out the contour in rectangle
+						cv2.putText(img, 'Civilian', (pt_upperleft[0], pt_upperleft[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 1, cv2.LINE_AA)
+
+		# 4) face detection
+		gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+		faces = faceCascade.detectMultiScale(
+			gray,
+			scaleFactor = 1.1,
+			minNeighbors = 5,
+			minSize = (30, 30),
+			flags = cv2.CASCADE_SCALE_IMAGE
+		)
+
+		#draw rectangles around faces
+		for (x, y, w, h) in faces:
+			cv2.rectangle(img, (x, y), (x+w, y+h), (255, 255, 255), 3)
+			cv2.putText(img, 'Face Detected', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+		cv2.imshow('img', img)
+		cv2.waitKey(3)
+		degX = (int(self.detected_shield_x) - 320)
+		degY = (240 - int(self.detected_shield_y))
+		self.tx[2] = (degX >> 8) & 255 # bitshift by 8 to right
+		self.tx[3] = (degX) & 255
+		self.tx[4] = (degY >> 8) & 255
+		self.tx[5] = (degY) & 255
+		#self.serCoor.write(bytearray(self.tx))
+		#self.serCoor.flushInput()
+		#self.serCoor.flushOutput()
+
+
+class Rectangle:
+	def __init__(self, x, y, w, h, angle):
+		self.x = x
+		self.y = y
+		self.w = w
+		self.h = h
+		self.angle = angle
+
+	def getKey_x(self):
+		return self.x
+
+	def getkey_h(self):
+		return self.h
+
+class detectedShield:
+	def __init__(self, w_size, x, y, x_l, y_l):
+		self.w_size = w_size
+		self.x = x
+		self.y = y
+		self.x_l = x_l
+		self.y_l = y_l
+
+	def getKey_size(self):
+		return self.w_size
+
+if __name__ == '__main__':
+	try:
+		Detector()
+	except rospy.ROSInterruptException:
+		pass
+
+
+
+
+
+
+
+
